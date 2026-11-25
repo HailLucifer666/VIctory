@@ -1,5 +1,6 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
+mod gate;
 mod policy;
 
 use std::path::{Path, PathBuf};
@@ -26,12 +27,20 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Run the tests, then fail unless the run executed what it announced
+    /// (see `gate`).
+    TestGate {
+        /// Arguments for `cargo test`; everything after the subcommand.
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::TestGate { args } => gate::run(&root, &args),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])

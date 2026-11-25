@@ -1,0 +1,413 @@
+//! `cargo xtask test-gate`: run the tests, then check the run against its own
+//! account of itself.
+//!
+//! `/kee` class 14: a green check that cannot be trusted is worse than no
+//! check, because it is read as safety. libtest announces a binary's tests
+//! (`running N tests`) and reports them (`test result: …`), and a filter that
+//! matches nothing prints `running 0 tests` and exits 0 — which CI reports as
+//! a pass. This gate counts what each binary announced against what it
+//! accounted for, and fails a run that executed nothing.
+//!
+//! Two things make that reading trustworthy:
+//!
+//! - Targets run serially (`--jobs 1`). Cargo otherwise runs test binaries
+//!   concurrently into one stdout, so a `test result:` from one binary lands
+//!   between another's lines and no report can be attributed. Measured at no
+//!   cost: 27s either way over this workspace.
+//! - The counts are only read when `cargo test` exited 0. A failing run
+//!   dumps captured test output into the same stream, which can contain
+//!   harness-shaped lines; that run is already red, so the gate reports
+//!   cargo's own diagnosis instead of guessing at the counts.
+//!
+//! Doc-test binaries are exempt from the per-binary zero check: a crate with
+//! no doc examples runs no doc tests, and a workspace sweep would otherwise
+//! be permanently red for a fact that is not a defect. The whole-run check
+//! still covers them.
+
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+
+/// One test binary: what it announced, and what it reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// The target as cargo named it, e.g. `unittests src\main.rs`; `None`
+    /// when cargo's targets could not be lined up with the reports.
+    pub target: Option<String>,
+    /// What `running N tests` announced; ignored tests are counted here.
+    pub announced: usize,
+    pub passed: usize,
+    pub failed: usize,
+    pub ignored: usize,
+}
+
+impl Report {
+    /// How to name this report in a message.
+    fn label(&self) -> &str {
+        self.target.as_deref().unwrap_or("(unnamed target)")
+    }
+
+    /// Tests that actually executed (ignored ones did not).
+    fn ran(&self) -> usize {
+        self.passed + self.failed
+    }
+
+    /// Tests the binary accounted for, executed or ignored.
+    fn counted(&self) -> usize {
+        self.passed + self.failed + self.ignored
+    }
+}
+
+/// Run `cargo test` with `args`, then gate the run.
+pub fn run(root: &Path, args: &[String]) -> Result<()> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let jobs_given = args
+        .iter()
+        .any(|a| a.starts_with("-j") || a.starts_with("--jobs"));
+    let mut command = Command::new(cargo);
+    command.arg("test").args(args);
+    // Every binary reports, even when an earlier one failed.
+    if !args.iter().any(|a| a == "--no-fail-fast") {
+        command.arg("--no-fail-fast");
+    }
+    // See the module doc: without this the output cannot be attributed.
+    if !jobs_given {
+        command.args(["--jobs", "1"]);
+    }
+    let out = command
+        .current_dir(root)
+        .output()
+        .context("running `cargo test`")?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    if !out.status.success() {
+        // Already red: cargo's own account of what fell over is better than
+        // anything inferred from a stream that now holds failure dumps.
+        for line in stderr
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| line.starts_with("error"))
+        {
+            eprintln!("{line}");
+        }
+        let failed = failures(&stdout);
+        if !failed.is_empty() {
+            eprintln!("{} test(s) reported FAILED:", failed.len());
+            for line in failed.iter().take(40) {
+                eprintln!("  {line}");
+            }
+        }
+        bail!("cargo test exited {}", out.status);
+    }
+
+    let mut reports = parse(&stdout);
+    if reports.is_empty() {
+        // Nothing to gate: say why rather than report success on nothing.
+        bail!(
+            "no test binary reported anything (cargo test exited {}):\n{}",
+            out.status,
+            tail(&stderr)
+        );
+    }
+    let names = targets(&stderr);
+    // Cargo names each target on stderr just before running it, so the Nth
+    // name matches the Nth report -- while the counts agree. A wrong name is
+    // worse than none, and the per-binary rules need a real one.
+    let paired = names.len() == reports.len();
+    if paired {
+        for (report, name) in reports.iter_mut().zip(&names) {
+            report.target = Some(name.clone());
+        }
+    }
+
+    for r in &reports {
+        println!(
+            "  {}: {} announced, {} accounted for ({} passed, {} failed, {} ignored)",
+            r.label(),
+            r.announced,
+            r.counted(),
+            r.passed,
+            r.failed,
+            r.ignored
+        );
+    }
+    let ran: usize = reports.iter().map(Report::ran).sum();
+    println!(
+        "test gate: {} binary/binaries, {ran} test(s) executed",
+        reports.len()
+    );
+    if !paired {
+        println!(
+            "test gate: {} target name(s) from cargo for {} report(s); per-binary check skipped",
+            names.len(),
+            reports.len()
+        );
+    }
+
+    let problems = problems(&reports);
+    if !problems.is_empty() {
+        for p in &problems {
+            eprintln!("GATE: {p}");
+        }
+        bail!(
+            "{} test-gate problem(s) in a run cargo called a success",
+            problems.len()
+        );
+    }
+    Ok(())
+}
+
+/// Everything wrong with a run that exited 0. Pure, so the rules can be
+/// tested without a suite to run.
+pub fn problems(reports: &[Report]) -> Vec<String> {
+    // One cause, one message: when nothing ran at all (an empty list
+    // included), the per-binary report would only repeat this for every
+    // binary in the run.
+    let ran: usize = reports.iter().map(Report::ran).sum();
+    if ran == 0 {
+        return vec![format!(
+            "the run executed no test ({} binary/binaries, {} announced)",
+            reports.len(),
+            reports.iter().map(|r| r.announced).sum::<usize>()
+        )];
+    }
+    let mut out = Vec::new();
+    for r in reports {
+        if r.counted() != r.announced {
+            out.push(format!(
+                "{}: announced {} test(s), accounted for {}",
+                r.label(),
+                r.announced,
+                r.counted()
+            ));
+        }
+        // A doc-test binary in a crate with no doc examples runs nothing by
+        // design; every other binary announcing nothing took a filter that
+        // matched none of its tests. Telling them apart takes a name, and an
+        // unnamed report here would fail every doc-test crate in the sweep.
+        let filtered = r.announced == 0
+            && r.target
+                .as_deref()
+                .is_some_and(|name| !name.starts_with("Doc-tests"));
+        if filtered {
+            out.push(format!(
+                "{}: announced 0 tests (a filter that matched nothing passes cargo)",
+                r.label()
+            ));
+        }
+    }
+    out
+}
+
+/// Read libtest's account of a run, in the order it printed it.
+pub fn parse(output: &str) -> Vec<Report> {
+    let mut reports: Vec<Report> = Vec::new();
+    for line in output.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(announced) = announced(line) {
+            reports.push(Report {
+                target: None,
+                announced,
+                passed: 0,
+                failed: 0,
+                ignored: 0,
+            });
+        } else if let Some((passed, failed, ignored)) = result(line)
+            && let Some(last) = reports.last_mut()
+        {
+            last.passed = passed;
+            last.failed = failed;
+            last.ignored = ignored;
+        }
+    }
+    reports
+}
+
+/// The targets cargo named, in the order it ran them: `Running unittests
+/// src\main.rs (…)` and `Doc-tests victory_core`. Cargo prints these on
+/// stderr; libtest's numbers come on stdout.
+pub fn targets(progress: &str) -> Vec<String> {
+    progress
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("Running ") {
+                return Some(rest.split(" (").next().unwrap_or(rest).to_owned());
+            }
+            line.starts_with("Doc-tests ").then(|| line.to_owned())
+        })
+        .collect()
+}
+
+/// The tests that reported themselves FAILED, as libtest printed them.
+pub fn failures(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(|line| line.trim_end_matches('\r').trim_end())
+        .filter(|line| line.starts_with("test ") && line.ends_with(" ... FAILED"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// `running 4 tests` / `running 1 test`.
+fn announced(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix("running ")?;
+    let (n, what) = rest.split_once(' ')?;
+    if !matches!(what, "test" | "tests") {
+        return None;
+    }
+    n.parse().ok()
+}
+
+/// `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered
+/// out; finished in 0.22s`. The verdict is not read: a run that reaches here
+/// exited 0, so it was `ok`.
+fn result(line: &str) -> Option<(usize, usize, usize)> {
+    let (_, counts) = line.strip_prefix("test result: ")?.split_once(". ")?;
+    let mut out = (0, 0, 0);
+    for part in counts.split("; ") {
+        let Some((n, kind)) = part.split_once(' ') else {
+            continue;
+        };
+        let Ok(n) = n.parse::<usize>() else {
+            continue;
+        };
+        match kind {
+            "passed" => out.0 = n,
+            "failed" => out.1 = n,
+            "ignored" => out.2 = n,
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// The last lines of a stream, for an error a reader can act on.
+fn tail(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines[lines.len().saturating_sub(20)..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{failures, parse, problems, targets};
+
+    /// One binary: `announced` tests, one `ok` line per test, then the result.
+    fn binary(announced: usize, verdict: &str, counts: &str) -> String {
+        let lines: String = (0..announced)
+            .map(|i| format!("test t{i} ... ok\n"))
+            .collect();
+        format!(
+            "running {announced} tests\n{lines}\n\
+             test result: {verdict}. {counts}; finished in 0.01s\n"
+        )
+    }
+
+    const OK4: &str = "4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+    const OK2: &str = "2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+
+    #[test]
+    fn counts_a_run_that_did_what_it_announced() {
+        let reports = parse(&binary(4, "ok", OK4));
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].announced, 4);
+        assert_eq!(reports[0].passed, 4);
+        assert!(problems(&reports).is_empty(), "{:?}", problems(&reports));
+    }
+
+    #[test]
+    fn a_filter_that_matched_nothing_is_one_failure() {
+        let nothing = "0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out";
+        let trouble = problems(&parse(&binary(0, "ok", nothing)));
+        assert_eq!(trouble.len(), 1, "one cause, one message: {trouble:?}");
+        assert!(trouble[0].contains("executed no test"), "{trouble:?}");
+    }
+
+    #[test]
+    fn an_announced_count_the_report_contradicts_is_a_failure() {
+        // Announced 4, accounted for 3: a run that stopped short.
+        let short = "3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        let trouble = problems(&parse(&binary(4, "ok", short)));
+        assert!(
+            trouble.iter().any(|p| p.contains("announced 4")),
+            "{trouble:?}"
+        );
+    }
+
+    #[test]
+    fn a_named_binary_that_announces_nothing_is_a_failure() {
+        // Named, so it is not mistaken for a doc-test crate with no examples.
+        let quiet = "0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        let output = format!("{}{}", binary(2, "ok", OK2), binary(0, "ok", quiet));
+        let mut reports = parse(&output);
+        reports[1].target = Some(String::from("unittests src\\lib.rs"));
+        let trouble = problems(&reports);
+        assert_eq!(trouble.len(), 1, "{trouble:?}");
+        assert!(trouble[0].contains("announced 0 tests"), "{trouble:?}");
+    }
+
+    #[test]
+    fn doc_tests_that_run_nothing_are_not_a_defect() {
+        let quiet = "0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        let output = format!("{}{}", binary(2, "ok", OK2), binary(0, "ok", quiet));
+        let mut reports = parse(&output);
+        reports[1].target = Some(String::from("Doc-tests victory_core"));
+        let trouble = problems(&reports);
+        assert!(trouble.is_empty(), "no doc examples is normal: {trouble:?}");
+    }
+
+    #[test]
+    fn an_unnamed_zero_report_is_not_called_a_filtered_one() {
+        // Names and reports do not always line up. Without a name the gate
+        // cannot tell a doc-test target from a filtered one, and guessing
+        // would fail every doc-test crate in the workspace.
+        let quiet = "0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        let reports = parse(&format!(
+            "{}{}",
+            binary(2, "ok", OK2),
+            binary(0, "ok", quiet)
+        ));
+        assert!(problems(&reports).is_empty(), "{:?}", problems(&reports));
+    }
+
+    #[test]
+    fn each_binary_keeps_its_own_count() {
+        let none = "0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out";
+        let reports = parse(&format!(
+            "{}{}",
+            binary(2, "ok", OK2),
+            binary(0, "ok", none)
+        ));
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].passed, 2);
+        assert_eq!(reports[1].announced, 0, "the second keeps its own count");
+    }
+
+    #[test]
+    fn cargo_names_each_binary_on_stderr() {
+        let progress = "   Compiling xtask v0.1.0\r\n    Finished `test` profile\r\n     \
+                        Running unittests src\\main.rs (target\\debug\\deps\\xtask.exe)\r\n\
+                        Doc-tests victory_core\r\n";
+        assert_eq!(
+            targets(progress),
+            vec!["unittests src\\main.rs", "Doc-tests victory_core"]
+        );
+    }
+
+    #[test]
+    fn a_failing_test_is_named() {
+        let output = "running 2 tests\ntest a ... ok\ntest b ... FAILED\n";
+        assert_eq!(failures(output), vec!["test b ... FAILED"]);
+        assert!(failures(&binary(2, "ok", OK2)).is_empty());
+    }
+
+    #[test]
+    fn an_empty_run_is_reported_not_passed() {
+        let trouble = problems(&[]);
+        assert_eq!(trouble.len(), 1, "{trouble:?}");
+        assert!(trouble[0].contains("executed no test"), "{trouble:?}");
+    }
+}

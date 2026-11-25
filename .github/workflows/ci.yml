@@ -31,3 +31,7 @@ jobs:
       # Includes xtask's repository_passes_policy, the asset-policy check.
       - name: Tests
         run: cargo test --workspace --locked
+      # The run above exits 0 on a filter that matched nothing; this one reads
+      # back how many tests each binary announced and reported.
+      - name: Tests, gate
+        run: cargo xtask test-gate --workspace --locked
