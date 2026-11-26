@@ -17,7 +17,9 @@
 //! - The counts are only read when `cargo test` exited 0. A failing run
 //!   dumps captured test output into the same stream, which can contain
 //!   harness-shaped lines; that run is already red, so the gate reports
-//!   cargo's own diagnosis instead of guessing at the counts.
+//!   cargo's own diagnosis instead of guessing at the counts. It also echoes
+//!   each failing test's panic: this process captured cargo's output, so if
+//!   the gate does not print the reason, nothing does.
 //!
 //! Doc-test binaries are exempt from the per-binary zero check: a crate with
 //! no doc examples runs no doc tests, and a workspace sweep would otherwise
@@ -99,6 +101,13 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
             for line in failed.iter().take(40) {
                 eprintln!("  {line}");
             }
+        }
+        // Why they fell over. The name list above says which, and nothing
+        // else: cargo's stdout was captured here, so the panics are in this
+        // process and nowhere else.
+        let why = details(&stdout);
+        if !why.is_empty() {
+            eprintln!("{why}");
         }
         bail!("cargo test exited {}", out.status);
     }
@@ -291,9 +300,57 @@ fn tail(text: &str) -> String {
     lines[lines.len().saturating_sub(20)..].join("\n")
 }
 
+/// What each failing test printed, from libtest's `---- <name> stdout ----`
+/// blocks. A red run that names the test and stops leaves the reader with
+/// nothing to act on, and the stream this reads was captured by the caller,
+/// so nobody else is going to print it.
+///
+/// Bounded, because a run can fail everywhere at once and the point is to
+/// make the first cause readable, not to reproduce the whole suite.
+fn details(output: &str) -> String {
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    let mut current: Option<Vec<&str>> = None;
+    for line in output.lines() {
+        let line = line.trim_end_matches('\r').trim_end();
+        if line.starts_with("---- ") && line.ends_with(" ----") {
+            if let Some(block) = current.take() {
+                blocks.push(block);
+            }
+            current = Some(vec![line]);
+            continue;
+        }
+        // The name list that closes a block. The one printed before the
+        // blocks arrives while nothing is open, so it is ignored.
+        if line == "failures:" {
+            if let Some(block) = current.take() {
+                blocks.push(block);
+            }
+            continue;
+        }
+        if let Some(block) = current.as_mut() {
+            block.push(line);
+        }
+    }
+    if let Some(block) = current {
+        blocks.push(block);
+    }
+
+    let mut out: Vec<&str> = Vec::new();
+    for block in &blocks {
+        let end = block
+            .iter()
+            .rposition(|line| !line.is_empty())
+            .map_or(0, |i| i + 1);
+        out.extend_from_slice(&block[..end]);
+        out.push("");
+    }
+    out.truncate(out.len().min(200));
+    out.join("\n").trim_end().to_owned()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{failures, parse, problems, targets};
+    use super::{details, failures, parse, problems, targets};
 
     /// One binary: `announced` tests, one `ok` line per test, then the result.
     fn binary(announced: usize, verdict: &str, counts: &str) -> String {
@@ -409,5 +466,43 @@ mod tests {
         let trouble = problems(&[]);
         assert_eq!(trouble.len(), 1, "{trouble:?}");
         assert!(trouble[0].contains("executed no test"), "{trouble:?}");
+    }
+
+    /// A red run has to say why. libtest prints the panic inside a
+    /// `---- <name> stdout ----` block; the name list alone is not actionable,
+    /// and on CI this is the only copy of that text.
+    #[test]
+    fn a_red_run_carries_the_panic_that_caused_it() {
+        let output = "\
+running 1 test
+test frame::tests::waits_end_on_ticks_and_count_frames ... FAILED
+
+failures:
+
+---- frame::tests::waits_end_on_ticks_and_count_frames stdout ----
+thread 'frame::tests::waits_end_on_ticks_and_count_frames' panicked at crates\\victory-gpu\\src\\frame.rs:243:9:
+assertion failed: before.elapsed() < Duration::from_millis(10)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    frame::tests::waits_end_on_ticks_and_count_frames
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+";
+        let why = details(output);
+        assert!(why.contains("assertion failed"), "{why}");
+        assert!(why.contains("frame.rs:243"), "{why}");
+        assert!(
+            !why.contains("test result:"),
+            "the block ends at the name list: {why}"
+        );
+    }
+
+    /// A run that fell over before any test started has no blocks; the
+    /// caller's own `error` lines carry that, so this must not invent one.
+    #[test]
+    fn a_red_run_with_no_block_yields_nothing() {
+        assert_eq!(details("error[E0308]: mismatched types\n"), "");
     }
 }
