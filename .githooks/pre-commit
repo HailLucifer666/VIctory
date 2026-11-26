@@ -1,3 +1,7 @@
 #!/bin/sh
-# Enforces the asset policy on every commit. Install with: cargo xtask install-hooks
-exec cargo xtask policy --staged
+# Enforces the asset policy on every commit, and that the workflow files still
+# load. GitHub reads those files before it creates a job, so one it cannot load
+# produces no run at all, and no CI check can report that from inside CI — this
+# hook is the only place it can be caught.
+# Install with: cargo xtask install-hooks
+cargo xtask policy --staged && cargo xtask workflows
