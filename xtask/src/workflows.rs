@@ -367,16 +367,22 @@ fn field<'a>(map: &'a Hash, name: &str) -> Option<&'a Yaml> {
 fn names_an_event(trigger: &Yaml) -> bool {
     match trigger {
         Yaml::String(event) => !event.is_empty(),
-        Yaml::Array(events) => !events.is_empty(),
+        // Every entry has to be an event name, not just some entry: `on: [42]`
+        // is a non-empty list GitHub refuses.
+        Yaml::Array(events) => {
+            !events.is_empty()
+                && events
+                    .iter()
+                    .all(|event| matches!(event, Yaml::String(s) if !s.is_empty()))
+        }
         Yaml::Hash(events) => !events.is_empty(),
         _ => false,
     }
 }
 
-/// Whether `runs-on:` names a runner. GitHub takes one label, a list of them,
-/// or a group/labels mapping; an empty list or an empty mapping names none.
-fn names_a_runner(runs_on: &Yaml) -> bool {
-    match runs_on {
+/// One label or a list of them; the value `labels:` takes.
+fn names_labels(labels: &Yaml) -> bool {
+    match labels {
         Yaml::String(label) => !label.is_empty(),
         Yaml::Array(labels) => {
             !labels.is_empty()
@@ -384,9 +390,28 @@ fn names_a_runner(runs_on: &Yaml) -> bool {
                     .iter()
                     .all(|label| matches!(label, Yaml::String(s) if !s.is_empty()))
         }
-        // `runs-on: { group: …, labels: … }` is a runner group, and refusing it
-        // would be a false red on a workflow GitHub schedules.
-        Yaml::Hash(fields) => !fields.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether `runs-on:` names a runner. GitHub takes one label, a list of them,
+/// or a group/labels mapping; an empty list or an empty mapping names none.
+/// A mapping with any key other than `group`/`labels`, or with a value of the
+/// wrong type, is a file GitHub refuses.
+fn names_a_runner(runs_on: &Yaml) -> bool {
+    match runs_on {
+        Yaml::String(label) => !label.is_empty(),
+        Yaml::Array(_) => names_labels(runs_on),
+        Yaml::Hash(fields) => {
+            !fields.is_empty()
+                && fields.iter().all(|(key, value)| match key {
+                    Yaml::String(key) if key == "group" => {
+                        matches!(value, Yaml::String(s) if !s.is_empty())
+                    }
+                    Yaml::String(key) if key == "labels" => names_labels(value),
+                    _ => false,
+                })
+        }
         _ => false,
     }
 }
@@ -647,6 +672,46 @@ jobs:
       - uses: actions/checkout@v5
 ";
         assert_eq!(problems("ci.yml", source), Vec::<String>::new());
+    }
+
+    /// A list is only a trigger list if every entry names an event. `on: [42]`
+    /// and `on: [push, {}]` are non-empty lists GitHub still refuses.
+    #[test]
+    fn a_trigger_list_with_a_non_event_entry_is_refused() {
+        for trigger in ["on: [42]", "on: [push, {}]", "on: [push, '']"] {
+            let source = format!(
+                "name: CI\n{trigger}\njobs:\n  check:\n    runs-on: windows-latest\n    steps:\n      - uses: actions/checkout@v5\n"
+            );
+            let found = problems("ci.yml", &source);
+            assert!(
+                found.iter().any(|p| p.contains("names no event")),
+                "{trigger}: {found:#?}"
+            );
+        }
+    }
+
+    /// The runner-group mapping has exactly two keys, and each takes a string
+    /// or a label list. An unknown key or a mis-typed value is a file GitHub
+    /// refuses, not a runner.
+    #[test]
+    fn a_runner_mapping_with_an_unknown_key_or_wrong_type_is_refused() {
+        for runs_on in [
+            "runs-on: {group: 1}",
+            "runs-on: {group: g, bogus: x}",
+            "runs-on: {group: ''}",
+            "runs-on: {labels: {a: b}}",
+        ] {
+            let source = format!(
+                "name: CI\non: [pull_request]\njobs:\n  check:\n    {runs_on}\n    steps:\n      - uses: actions/checkout@v5\n"
+            );
+            let found = problems("ci.yml", &source);
+            assert!(
+                found
+                    .iter()
+                    .any(|p| p.contains("no `runs-on` naming a runner")),
+                "{runs_on}: {found:#?}"
+            );
+        }
     }
 
     /// A job is a call or a job, never both. The `uses` arm would otherwise

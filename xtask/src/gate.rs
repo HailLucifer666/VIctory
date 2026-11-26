@@ -35,6 +35,20 @@
 //! binary, so the per-binary check cannot run and the run is refused rather
 //! than reported green with the check silently skipped.
 //!
+//! What this cannot see, stated so the green is not read as more than it is:
+//!
+//! - stdout is a pipe any test can write to. A test that prints a
+//!   `test result:` line and exits the process can close its binary's report
+//!   on the harness's behalf, and the gate never counts `test … ok` lines, so
+//!   only cargo's exit status protects a *red* run. A green gate means every
+//!   binary cargo named reported a consistent account; it is not proof that no
+//!   test wrote into that account.
+//! - a target built with `harness = false` prints no libtest report, so a run
+//!   that contains one is refused as unattributable rather than gated.
+//! - a narrowed command (`--exclude`, `-p`, `--lib`, `--doc`) is gated as the
+//!   set it ran. The gate cannot know what the workspace would otherwise have
+//!   run, so CI's command line is what asserts coverage.
+//!
 //! Doc-test binaries are exempt from the per-binary zero check: a crate with
 //! no doc examples runs no doc tests, and a workspace sweep would otherwise
 //! be permanently red for a fact that is not a defect. The whole-run check
@@ -68,6 +82,11 @@ pub struct Report {
     pub passed: usize,
     pub failed: usize,
     pub ignored: usize,
+    /// Tests libtest removed before running them. `running 0 tests` alone
+    /// cannot tell a binary with no tests from a filter that matched none:
+    /// the first counted 0 filtered out, the second counted the tests it
+    /// removed. Only the second is a defect.
+    pub filtered: usize,
 }
 
 impl Report {
@@ -318,17 +337,21 @@ pub fn problems(reports: &[Report]) -> Vec<String> {
             ));
         }
         // A doc-test binary in a crate with no doc examples runs nothing by
-        // design; every other binary announcing nothing took a filter that
-        // matched none of its tests. Telling them apart takes a name, and an
-        // unnamed report here would fail every doc-test crate in the sweep.
-        let filtered = r.announced == 0
+        // design, and so does a binary target with no tests of its own: both
+        // report `0 filtered out`. A filter that matched none of a binary's
+        // tests reports the tests it removed instead. Telling them apart takes
+        // the filtered count and a name, and an unnamed report here would fail
+        // every doc-test crate in the sweep.
+        let removed = r.announced == 0
+            && r.filtered > 0
             && r.target
                 .as_deref()
                 .is_some_and(|name| !name.starts_with("Doc-tests"));
-        if filtered {
+        if removed {
             out.push(format!(
-                "{}: announced 0 tests (a filter that matched nothing passes cargo)",
-                r.label()
+                "{}: announced 0 tests after filtering out {} (a filter that matched nothing passes cargo)",
+                r.label(),
+                r.filtered
             ));
         }
     }
@@ -378,9 +401,10 @@ pub fn parse(output: &str) -> Vec<Report> {
                 passed: 0,
                 failed: 0,
                 ignored: 0,
+                filtered: 0,
             });
             open.push(reports.len() - 1);
-        } else if let Some((passed, failed, ignored)) = result(&line)
+        } else if let Some((passed, failed, ignored, filtered)) = result(&line)
             && let Some(index) = open.pop()
         {
             let report = &mut reports[index];
@@ -388,6 +412,7 @@ pub fn parse(output: &str) -> Vec<Report> {
             report.passed = passed;
             report.failed = failed;
             report.ignored = ignored;
+            report.filtered = filtered;
         }
     }
     reports
@@ -463,9 +488,9 @@ fn announced(line: &str) -> Option<usize> {
 /// `test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered
 /// out; finished in 0.22s`. The verdict is not read: a run that reaches here
 /// exited 0, so it was `ok`.
-fn result(line: &str) -> Option<(usize, usize, usize)> {
+fn result(line: &str) -> Option<(usize, usize, usize, usize)> {
     let (_, counts) = line.strip_prefix("test result: ")?.split_once(". ")?;
-    let mut out = (0, 0, 0);
+    let mut out = (0, 0, 0, 0);
     for part in counts.split("; ") {
         let Some((n, kind)) = part.split_once(' ') else {
             continue;
@@ -477,6 +502,7 @@ fn result(line: &str) -> Option<(usize, usize, usize)> {
             "passed" => out.0 = n,
             "failed" => out.1 = n,
             "ignored" => out.2 = n,
+            "filtered out" => out.3 = n,
             _ => {}
         }
     }
@@ -811,14 +837,29 @@ test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; fini
 
     #[test]
     fn a_named_binary_that_announces_nothing_is_a_failure() {
-        // Named, so it is not mistaken for a doc-test crate with no examples.
-        let quiet = "0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        // Named, so it is not mistaken for a doc-test crate with no examples,
+        // and 3 filtered out, so it is a filter that removed every test it
+        // had rather than a target that has none.
+        let quiet = "0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out";
         let output = format!("{}{}", binary(2, "ok", OK2), binary(0, "ok", quiet));
         let mut reports = parse(&output);
         reports[1].target = Some(String::from("unittests src\\lib.rs"));
         let trouble = problems(&reports);
         assert_eq!(trouble.len(), 1, "{trouble:?}");
-        assert!(trouble[0].contains("announced 0 tests"), "{trouble:?}");
+        assert!(trouble[0].contains("after filtering out 3"), "{trouble:?}");
+    }
+
+    /// A binary target with no tests of its own reports `running 0 tests` too.
+    /// It filtered nothing out, so it is not a filter that matched nothing and
+    /// refusing it would fail every workspace that has a test-less bin.
+    #[test]
+    fn a_target_with_no_tests_is_not_a_filter_failure() {
+        let none = "0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        let output = format!("{}{}", binary(2, "ok", OK2), binary(0, "ok", none));
+        let mut reports = parse(&output);
+        reports[1].target = Some(String::from("unittests src\\main.rs"));
+        let trouble = problems(&reports);
+        assert!(trouble.is_empty(), "{trouble:?}");
     }
 
     #[test]
