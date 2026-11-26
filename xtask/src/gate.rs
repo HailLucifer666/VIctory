@@ -368,8 +368,8 @@ pub fn parse(output: &str) -> Vec<Report> {
     // Indices of reports announced but not yet closed by a result.
     let mut open: Vec<usize> = Vec::new();
     for line in output.lines() {
-        let line = line.trim_end_matches('\r');
-        if let Some(announced) = announced(line) {
+        let line = plain(line.trim_end_matches('\r'));
+        if let Some(announced) = announced(&line) {
             reports.push(Report {
                 target: None,
                 depth: open.len(),
@@ -380,7 +380,7 @@ pub fn parse(output: &str) -> Vec<Report> {
                 ignored: 0,
             });
             open.push(reports.len() - 1);
-        } else if let Some((passed, failed, ignored)) = result(line)
+        } else if let Some((passed, failed, ignored)) = result(&line)
             && let Some(index) = open.pop()
         {
             let report = &mut reports[index];
@@ -393,6 +393,34 @@ pub fn parse(output: &str) -> Vec<Report> {
     reports
 }
 
+/// A line with ANSI color sequences removed.
+///
+/// CI sets `CARGO_TERM_COLOR=always`, and cargo colors `Running` and
+/// `Doc-tests`. The prefix matches are on the plain word, and a colored line
+/// starts with an escape byte — which is how `targets` returned zero names on
+/// CI while finding them locally, where cargo writes no color.
+fn plain(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // CSI: `ESC [`, then parameter and intermediate bytes, then a final
+        // byte in `@`..=`~`. Anything else after an escape is dropped with it.
+        if chars.next() != Some('[') {
+            continue;
+        }
+        for c in chars.by_ref() {
+            if ('@'..='~').contains(&c) {
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// The targets cargo named, in the order it ran them: `Running unittests
 /// src\main.rs (…)` and `Doc-tests victory_core`. Cargo prints these on
 /// stderr; libtest's numbers come on stdout.
@@ -400,11 +428,14 @@ pub fn targets(progress: &str) -> Vec<String> {
     progress
         .lines()
         .filter_map(|line| {
+            // Strip first: cargo's indent sits *inside* the color span, so it
+            // survives the escapes and trimming has to come after.
+            let line = plain(line);
             let line = line.trim();
             if let Some(rest) = line.strip_prefix("Running ") {
                 return Some(rest.split(" (").next().unwrap_or(rest).to_owned());
             }
-            line.starts_with("Doc-tests ").then(|| line.to_owned())
+            line.starts_with("Doc-tests ").then_some(line.to_owned())
         })
         .collect()
 }
@@ -413,9 +444,9 @@ pub fn targets(progress: &str) -> Vec<String> {
 pub fn failures(output: &str) -> Vec<String> {
     output
         .lines()
-        .map(|line| line.trim_end_matches('\r').trim_end())
+        .map(|line| plain(line.trim_end_matches('\r')))
+        .map(|line| line.trim_end().to_owned())
         .filter(|line| line.starts_with("test ") && line.ends_with(" ... FAILED"))
-        .map(str::to_owned)
         .collect()
 }
 
@@ -837,6 +868,34 @@ test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; fini
             targets(progress),
             vec!["unittests src\\main.rs", "Doc-tests victory_core"]
         );
+    }
+
+    /// CI sets `CARGO_TERM_COLOR=always`, so cargo wraps `Running` and
+    /// `Doc-tests` in escape codes and the name starts with ESC. The first
+    /// push of the strict pairing rule read that as zero targets and refused
+    /// a green workspace run; this is the exact line shape from run
+    /// 45819533685.
+    #[test]
+    fn colored_cargo_progress_still_names_its_targets() {
+        let progress = "\u{1b}[1m\u{1b}[92m     Running\u{1b}[0m unittests src\\lib.rs \
+                        (target\\debug\\deps\\x.exe)\r\n\
+                        \u{1b}[1m\u{1b}[92m   Doc-tests\u{1b}[0m victory_core\r\n";
+        assert_eq!(
+            targets(progress),
+            vec!["unittests src\\lib.rs", "Doc-tests victory_core"]
+        );
+    }
+
+    /// The harness's own lines can carry color too; a stripped line must
+    /// still count.
+    #[test]
+    fn colored_harness_lines_still_parse() {
+        let output = "\u{1b}[32mrunning 1 test\u{1b}[0m\n\
+                      \u{1b}[32mtest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; \
+                      0 filtered out\u{1b}[0m; finished in 0.01s\n";
+        let reports = parse(output);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].counted(), 1);
     }
 
     #[test]
