@@ -2,6 +2,7 @@
 
 mod gate;
 mod policy;
+mod workflows;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -34,6 +35,10 @@ enum Cmd {
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Fail unless every file under `.github/workflows/` is one GitHub can
+    /// load, since a file it cannot load produces no run at all (see
+    /// `workflows`).
+    Workflows,
 }
 
 fn main() -> Result<()> {
@@ -41,6 +46,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::TestGate { args } => gate::run(&root, &args),
+        Cmd::Workflows => workflows::run(&root),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
@@ -57,7 +63,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn workspace_root() -> PathBuf {
+pub(crate) fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask lives in the workspace")

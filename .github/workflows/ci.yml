@@ -28,10 +28,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy, diagnostics build
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      # Includes xtask's repository_passes_policy, the asset-policy check.
-      - name: Tests
-        run: cargo test --workspace --locked
-      # The run above exits 0 on a filter that matched nothing; this one reads
-      # back how many tests each binary announced and reported.
+      # Runs tests and the gate in one pass: `test-gate` runs `cargo test`,
+      # which includes xtask's repository_passes_policy, the asset-policy
+      # check, and then fails on a run that executed nothing (exit 1 if no
+      # tests ran).
       - name: Tests, gate
         run: cargo xtask test-gate --workspace --locked
