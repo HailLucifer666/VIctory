@@ -1,14 +1,14 @@
 //! `cargo xtask test-gate`: run the tests, then check the run against its own
 //! account of itself.
 //!
-//! `/kee` class 14: a green check that cannot be trusted is worse than no
-//! check, because it is read as safety. libtest announces a binary's tests
-//! (`running N tests`) and reports them (`test result: …`), and a filter that
-//! matches nothing prints `running 0 tests` and exits 0 — which CI reports as
-//! a pass. This gate counts what each binary announced against what it
-//! accounted for, and fails a run that executed nothing.
+//! A green check that cannot be trusted is worse than no check, because it is
+//! read as safety. libtest announces a binary's tests (`running N tests`) and
+//! reports them (`test result: …`), and a filter that matches nothing prints
+//! `running 0 tests` and exits 0 — which CI reports as a pass. This gate
+//! counts what each binary announced against what it accounted for, and fails
+//! a run that executed nothing.
 //!
-//! Two things make that reading trustworthy:
+//! Three things make that reading trustworthy:
 //!
 //! - Targets run serially (`--jobs 1`). Cargo otherwise runs test binaries
 //!   concurrently into one stdout, so a `test result:` from one binary lands
@@ -20,6 +20,10 @@
 //!   cargo's own diagnosis instead of guessing at the counts. It also echoes
 //!   each failing test's panic: this process captured cargo's output, so if
 //!   the gate does not print the reason, nothing does.
+//! - Reports nest. A test that spawns `current_exe()` writes the child's
+//!   harness lines into the same stream, ahead of the parent's own result.
+//!   `parse` attaches counts last-in-first-out, and only the outermost
+//!   reports — the binaries cargo ran and named — are gated.
 //!
 //! Doc-test binaries are exempt from the per-binary zero check: a crate with
 //! no doc examples runs no doc tests, and a workspace sweep would otherwise
@@ -37,6 +41,11 @@ pub struct Report {
     /// The target as cargo named it, e.g. `unittests src\main.rs`; `None`
     /// when cargo's targets could not be lined up with the reports.
     pub target: Option<String>,
+    /// How many reports were open when this one was announced: 0 is a binary
+    /// cargo ran, 1+ is a child process a test spawned. A test that spawns
+    /// `current_exe()` writes the child's `running N tests` / `test result:`
+    /// lines into the same stream, ahead of the parent's own result.
+    pub depth: usize,
     /// What `running N tests` announced; ignored tests are counted here.
     pub announced: usize,
     pub passed: usize,
@@ -61,22 +70,45 @@ impl Report {
     }
 }
 
+/// The arguments for `cargo test`, with the gate's own flags placed where
+/// cargo accepts them: before the `--` that starts libtest's arguments.
+///
+/// Appending them at the end instead hands `--no-fail-fast` and `--jobs` to
+/// libtest as soon as the caller has written `--`, and libtest refuses them
+/// (`error: Unrecognized option: 'no-fail-fast'`, exit 101, no test runs).
+pub fn argv(args: &[String]) -> Vec<String> {
+    let separator = args.iter().position(|a| a == "--");
+    let (to_cargo, to_harness) = match separator {
+        Some(at) => (&args[..at], Some(&args[at + 1..])),
+        None => (args, None),
+    };
+    let mut out = vec![String::from("test")];
+    out.extend(to_cargo.iter().cloned());
+    // Every binary reports, even when an earlier one failed.
+    if !to_cargo.iter().any(|a| a == "--no-fail-fast") {
+        out.push(String::from("--no-fail-fast"));
+    }
+    // See the module doc: without one binary at a time, the output cannot be
+    // attributed.
+    if !to_cargo
+        .iter()
+        .any(|a| a.starts_with("-j") || a.starts_with("--jobs"))
+    {
+        out.push(String::from("--jobs"));
+        out.push(String::from("1"));
+    }
+    if let Some(to_harness) = to_harness {
+        out.push(String::from("--"));
+        out.extend(to_harness.iter().cloned());
+    }
+    out
+}
+
 /// Run `cargo test` with `args`, then gate the run.
 pub fn run(root: &Path, args: &[String]) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let jobs_given = args
-        .iter()
-        .any(|a| a.starts_with("-j") || a.starts_with("--jobs"));
     let mut command = Command::new(cargo);
-    command.arg("test").args(args);
-    // Every binary reports, even when an earlier one failed.
-    if !args.iter().any(|a| a == "--no-fail-fast") {
-        command.arg("--no-fail-fast");
-    }
-    // See the module doc: without this the output cannot be attributed.
-    if !jobs_given {
-        command.args(["--jobs", "1"]);
-    }
+    command.args(argv(args));
     let out = command
         .current_dir(root)
         .output()
@@ -86,28 +118,12 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     if !out.status.success() {
-        // Already red: cargo's own account of what fell over is better than
-        // anything inferred from a stream that now holds failure dumps.
-        for line in stderr
-            .lines()
-            .map(str::trim_end)
-            .filter(|line| line.starts_with("error"))
-        {
-            eprintln!("{line}");
-        }
-        let failed = failures(&stdout);
-        if !failed.is_empty() {
-            eprintln!("{} test(s) reported FAILED:", failed.len());
-            for line in failed.iter().take(40) {
-                eprintln!("  {line}");
-            }
-        }
-        // Why they fell over. The name list above says which, and nothing
-        // else: cargo's stdout was captured here, so the panics are in this
-        // process and nowhere else.
-        let why = details(&stdout);
-        if !why.is_empty() {
-            eprintln!("{why}");
+        // Already red, so the counts are not read: a failure dump can hold
+        // harness-shaped lines. The report is what a reader needs instead,
+        // and this process captured it, so nothing else will print it.
+        let report = failure_report(&stdout, &stderr);
+        if !report.is_empty() {
+            eprintln!("{report}");
         }
         bail!("cargo test exited {}", out.status);
     }
@@ -118,21 +134,30 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
         bail!(
             "no test binary reported anything (cargo test exited {}):\n{}",
             out.status,
-            tail(&stderr)
+            tail(&stderr, 20)
         );
     }
+    // Only the outermost reports are binaries cargo ran. The rest are child
+    // processes a test spawned to run this binary again, and cargo has no
+    // target name for them.
+    let top: Vec<usize> = reports
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.depth == 0)
+        .map(|(i, _)| i)
+        .collect();
     let names = targets(&stderr);
     // Cargo names each target on stderr just before running it, so the Nth
-    // name matches the Nth report -- while the counts agree. A wrong name is
-    // worse than none, and the per-binary rules need a real one.
-    let paired = names.len() == reports.len();
+    // name matches the Nth target report -- while the counts agree. A wrong
+    // name is worse than none, and the per-binary rules need a real one.
+    let paired = names.len() == top.len();
     if paired {
-        for (report, name) in reports.iter_mut().zip(&names) {
-            report.target = Some(name.clone());
+        for (index, name) in top.iter().zip(&names) {
+            reports[*index].target = Some(name.clone());
         }
     }
 
-    for r in &reports {
+    for r in reports.iter().filter(|r| r.depth == 0) {
         println!(
             "  {}: {} announced, {} accounted for ({} passed, {} failed, {} ignored)",
             r.label(),
@@ -143,20 +168,27 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
             r.ignored
         );
     }
-    let ran: usize = reports.iter().map(Report::ran).sum();
+    let top_reports: Vec<Report> = top.iter().map(|i| reports[*i].clone()).collect();
+    let ran: usize = top_reports.iter().map(Report::ran).sum();
     println!(
         "test gate: {} binary/binaries, {ran} test(s) executed",
-        reports.len()
+        top_reports.len()
     );
+    let nested = reports.len() - top.len();
+    if nested > 0 {
+        // Counted separately, not hidden: a nested run is a test running
+        // this binary again, not a target cargo executed.
+        println!("test gate: {nested} nested report(s), from test(s) that ran this binary again");
+    }
     if !paired {
         println!(
             "test gate: {} target name(s) from cargo for {} report(s); per-binary check skipped",
             names.len(),
-            reports.len()
+            top_reports.len()
         );
     }
 
-    let problems = problems(&reports);
+    let problems = problems(&top_reports);
     if !problems.is_empty() {
         for p in &problems {
             eprintln!("GATE: {p}");
@@ -212,24 +244,37 @@ pub fn problems(reports: &[Report]) -> Vec<String> {
 }
 
 /// Read libtest's account of a run, in the order it printed it.
+///
+/// Reports nest. A test that spawns `current_exe()` inherits this stream, so
+/// the child's `running N tests` lands between the parent's announcement and
+/// its result — measured in `victory-hle`, where the child's 1-test report
+/// arrives first and the parent's 152-test result last. Results therefore
+/// close reports last-in-first-out; attaching one to the latest announcement
+/// instead (rather than the latest *unresolved* one) would give the parent's
+/// 152 counts to the child and leave the parent accounting for nothing.
 pub fn parse(output: &str) -> Vec<Report> {
     let mut reports: Vec<Report> = Vec::new();
+    // Indices of reports announced but not yet closed by a result.
+    let mut open: Vec<usize> = Vec::new();
     for line in output.lines() {
         let line = line.trim_end_matches('\r');
         if let Some(announced) = announced(line) {
             reports.push(Report {
                 target: None,
+                depth: open.len(),
                 announced,
                 passed: 0,
                 failed: 0,
                 ignored: 0,
             });
+            open.push(reports.len() - 1);
         } else if let Some((passed, failed, ignored)) = result(line)
-            && let Some(last) = reports.last_mut()
+            && let Some(index) = open.pop()
         {
-            last.passed = passed;
-            last.failed = failed;
-            last.ignored = ignored;
+            let report = &mut reports[index];
+            report.passed = passed;
+            report.failed = failed;
+            report.ignored = ignored;
         }
     }
     reports
@@ -295,9 +340,48 @@ fn result(line: &str) -> Option<(usize, usize, usize)> {
 }
 
 /// The last lines of a stream, for an error a reader can act on.
-fn tail(text: &str) -> String {
+fn tail(text: &str, count: usize) -> String {
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    lines[lines.len().saturating_sub(20)..].join("\n")
+    lines[lines.len().saturating_sub(count)..].join("\n")
+}
+
+/// What a red run should say, from the two streams cargo wrote.
+///
+/// A failing test is named, and the panic block libtest printed for it is
+/// echoed. A run that failed with no failed test never reached one: a build
+/// error, a bad argument, or a harness that refused a flag. Its useful lines
+/// — `error[E0308]`, the `--> file:line` that locates it, the span under it —
+/// do not all begin with `error`, so a prefix filter drops exactly the
+/// location and leaves the reader with a message and nothing to open.
+pub fn failure_report(stdout: &str, stderr: &str) -> String {
+    let failed = failures(stdout);
+    if failed.is_empty() {
+        return tail(stderr, 60);
+    }
+    let mut out = String::new();
+    for line in stderr
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| line.starts_with("error"))
+    {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!("{} test(s) reported FAILED:\n", failed.len()));
+    for line in failed.iter().take(40) {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Why they fell over. The name list above says which, and nothing else:
+    // this process captured cargo's output, so the panics are in here and
+    // nowhere else.
+    let why = details(stdout);
+    if !why.is_empty() {
+        out.push_str(&why);
+        out.push('\n');
+    }
+    out.trim_end().to_owned()
 }
 
 /// What each failing test printed, from libtest's `---- <name> stdout ----`
@@ -350,7 +434,7 @@ fn details(output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{details, failures, parse, problems, targets};
+    use super::{Report, argv, details, failure_report, failures, parse, problems, targets};
 
     /// One binary: `announced` tests, one `ok` line per test, then the result.
     fn binary(announced: usize, verdict: &str, counts: &str) -> String {
@@ -504,5 +588,107 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
     #[test]
     fn a_red_run_with_no_block_yields_nothing() {
         assert_eq!(details("error[E0308]: mismatched types\n"), "");
+    }
+
+    /// The stream `victory-hle` really produces: one test spawns
+    /// `current_exe()` with inherited stdout, so a 1-test child announces
+    /// inside the parent binary's run and reports first. Attaching each
+    /// result to the latest announcement gave the child the parent's 152
+    /// counts and left the parent accounting for nothing.
+    #[test]
+    fn a_child_process_report_keeps_its_parents_counts() {
+        let output = "\
+running 152 tests
+test host::imp::tests::loading_a_host_dll_does_not_block_thread_attach ... ok
+running 1 test
+test host::imp::tests::loading_a_host_dll_does_not_block_thread_attach ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 151 filtered out; finished in 0.52s
+test result: ok. 152 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
+";
+        let reports = parse(output);
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].depth, 0, "the binary cargo ran");
+        assert_eq!(reports[0].announced, 152);
+        assert_eq!(reports[0].counted(), 152, "the parent keeps its own counts");
+        assert_eq!(reports[1].depth, 1, "the child the test spawned");
+        assert_eq!(reports[1].counted(), 1);
+        let top: Vec<Report> = reports.into_iter().filter(|r| r.depth == 0).collect();
+        assert!(problems(&top).is_empty(), "{:?}", problems(&top));
+    }
+
+    /// Flags after `--` belong to libtest, which refuses cargo's own. Written
+    /// at the end they reached it: `error: Unrecognized option:
+    /// 'no-fail-fast'`, exit 101, and nothing ran.
+    #[test]
+    fn the_gates_flags_go_before_the_harness_separator() {
+        let given: Vec<String> = ["-p", "xtask", "--", "no_such_test"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            argv(&given),
+            [
+                "test",
+                "-p",
+                "xtask",
+                "--no-fail-fast",
+                "--jobs",
+                "1",
+                "--",
+                "no_such_test"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+    }
+
+    #[test]
+    fn flags_the_caller_gave_are_not_duplicated() {
+        let given: Vec<String> = ["-p", "xtask", "--jobs", "4", "--no-fail-fast"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            argv(&given),
+            ["test", "-p", "xtask", "--jobs", "4", "--no-fail-fast"]
+                .map(String::from)
+                .to_vec()
+        );
+    }
+
+    /// A build error is not a test failure, and the line that locates it does
+    /// not begin with `error`. Echoing only `error`-prefixed lines printed
+    /// the message and hid the file, line and caret.
+    #[test]
+    fn a_build_error_keeps_the_line_that_names_the_source() {
+        let stderr = "\
+error[E0308]: mismatched types
+  --> xtask\\src\\main.rs:54:9
+   |
+54 |         Cmd::Workflows => workflows::run(&root),
+   |         ^^^^^^^^^^^^^^ expected unit variant
+   |
+error: could not compile `xtask` (bin \"xtask\") due to 2 previous errors
+";
+        let report = failure_report("", stderr);
+        assert!(report.contains("--> xtask\\src\\main.rs:54:9"), "{report}");
+        assert!(report.contains("E0308"), "{report}");
+    }
+
+    #[test]
+    fn a_test_failure_names_the_test_and_its_panic() {
+        let stdout = "\
+running 1 test
+test a ... FAILED
+
+failures:
+
+---- a stdout ----
+thread 'a' panicked at src\\lib.rs:10:5:
+assertion failed
+";
+        let report = failure_report(stdout, "error: test failed, to rerun pass `-p x`\n");
+        assert!(report.contains("1 test(s) reported FAILED:"), "{report}");
+        assert!(report.contains("test a ... FAILED"), "{report}");
+        assert!(report.contains("assertion failed"), "{report}");
+        assert!(report.contains("error: test failed"), "{report}");
     }
 }
