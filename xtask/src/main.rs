@@ -184,4 +184,28 @@ mod tests {
         let mode = std::fs::metadata(&hook).unwrap().permissions().mode();
         assert_eq!(mode & 0o111, 0o111, "mode {mode:o} has no execute bit");
     }
+
+    /// The mode is a property of the commit, not of a Windows checkout: a
+    /// split commit reset it once already (`7878c324`), and no Windows test
+    /// can see it. Assert the tree git will hand a POSIX clone.
+    #[test]
+    fn the_hook_is_committed_executable() {
+        let output = Command::new("git")
+            .current_dir(workspace_root())
+            .args(["ls-tree", "HEAD", ".githooks/pre-commit"])
+            .output();
+        let Ok(output) = output else {
+            eprintln!("no git; the committed hook mode cannot be checked here");
+            return;
+        };
+        if !output.status.success() {
+            eprintln!("git ls-tree failed; the committed hook mode cannot be checked here");
+            return;
+        }
+        let tree = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            tree.starts_with("100755 "),
+            "the hook is not committed executable: {tree}"
+        );
+    }
 }

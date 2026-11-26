@@ -245,10 +245,14 @@ fn copy(mut from: impl Read, mut to: impl Write) -> std::io::Result<Vec<u8>> {
     let mut all = Vec::new();
     let mut buffer = [0u8; 8 * 1024];
     loop {
-        let read = from.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(all);
-        }
+        let read = match from.read(&mut buffer) {
+            Ok(0) => return Ok(all),
+            Ok(read) => read,
+            // End the capture rather than discard it: the bytes already
+            // echoed are the only log a killed run leaves, and a read error
+            // says nothing about what was run.
+            Err(_) => return Ok(all),
+        };
         all.extend_from_slice(&buffer[..read]);
         // The capture is what the gate parses. A destination that closed (a
         // reader that piped this into `head` and stopped) must not lose it,
@@ -316,6 +320,16 @@ fn print_reports(reports: &[Report]) {
 /// tested without a suite to run.
 pub fn problems(reports: &[Report]) -> Vec<String> {
     let mut out = Vec::new();
+    // Every binary announced nothing. That is one cause, one message, whether
+    // it is an empty list or a filter that removed every test everywhere; a
+    // line per binary would turn a workspace typo into twenty-six.
+    let announced_total: usize = reports.iter().map(|r| r.announced).sum();
+    if announced_total == 0 {
+        return vec![format!(
+            "the run executed no test ({} binary/binaries, 0 announced)",
+            reports.len()
+        )];
+    }
     // An announcement no result ever closed: a child that announced inside
     // its parent and never reported consumed the parent's result, so the
     // parent's zeros are not what it executed. Named as the unaccounted
@@ -357,21 +371,10 @@ pub fn problems(reports: &[Report]) -> Vec<String> {
     }
     let ran: usize = reports.iter().map(Report::ran).sum();
     if ran == 0 && out.is_empty() {
-        // One cause, one message. Nothing ran, and every announcement was
-        // closed by its own result, so the per-binary rules above found
-        // nothing to say. Two ways to get here, and they are not the same
-        // run: nothing was announced at all (an empty list included), or
-        // tests were announced and every one was ignored.
-        let announced: usize = reports.iter().map(|r| r.announced).sum();
-        if announced == 0 {
-            return vec![format!(
-                "the run executed no test ({} binary/binaries, {} announced)",
-                reports.len(),
-                announced
-            )];
-        }
+        // One cause, one message. Tests were announced and every one was
+        // ignored; the all-zero case returned above.
         return vec![format!(
-            "{announced} test(s) announced and none executed (every test that reported was ignored)"
+            "{announced_total} test(s) announced and none executed (every test that reported was ignored)"
         )];
     }
     out
@@ -531,10 +534,10 @@ pub fn failure_report(stdout: &str, stderr: &str) -> String {
     let mut out = String::new();
     for line in stderr
         .lines()
-        .map(str::trim_end)
+        .map(|line| plain(line.trim_end()))
         .filter(|line| line.starts_with("error"))
     {
-        out.push_str(line);
+        out.push_str(&line);
         out.push('\n');
     }
     out.push_str(&format!("{} test(s) reported FAILED:\n", failed.len()));
@@ -543,9 +546,9 @@ pub fn failure_report(stdout: &str, stderr: &str) -> String {
         out.push_str(line);
         out.push('\n');
     }
-    // Why they fell over. The name list above says which, and nothing else:
-    // this process captured cargo's output, so the panics are in here and
-    // nowhere else.
+    // Why they fell over. The echo above showed these bytes live; this repeats
+    // the blocks after the name list so the report reads as one account, and a
+    // reader who kept only the log still has the panic.
     let why = details(stdout);
     if !why.is_empty() {
         out.push_str(&why);
@@ -568,7 +571,11 @@ const EXCERPT_BLOCK_LINES: usize = 24;
 /// the error that explains the rest. The stream's tail is still the fallback
 /// for a failure that prints no `error` line at all.
 pub fn error_excerpt(stderr: &str) -> String {
-    let lines: Vec<&str> = stderr.lines().map(str::trim_end).collect();
+    // Colour first: CI sets `CARGO_TERM_COLOR=always`, and a coloured
+    // `error[E0308]` starts with an escape byte, so a raw prefix match finds
+    // no block and falls back to the tail — the very behaviour this excerpt
+    // replaced.
+    let lines: Vec<String> = stderr.lines().map(|line| plain(line.trim_end())).collect();
     let mut out: Vec<&str> = Vec::new();
     let mut blocks = 0;
     let mut start = 0;
@@ -589,7 +596,7 @@ pub fn error_excerpt(stderr: &str) -> String {
         {
             end += 1;
         }
-        out.extend_from_slice(&lines[start..end]);
+        out.extend(lines[start..end].iter().map(String::as_str));
         out.push("");
         start = end;
     }
@@ -693,6 +700,20 @@ mod tests {
             trouble[0].contains("a filter that matched nothing"),
             "{trouble:?}"
         );
+    }
+
+    /// When every binary was filtered to nothing, the cause is one cause: a
+    /// workspace typo should not print one line per binary.
+    #[test]
+    fn every_binary_filtered_to_nothing_is_one_message() {
+        let nothing = "0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out";
+        let mut output = String::new();
+        for _ in 0..26 {
+            output.push_str(&binary(0, "ok", nothing));
+        }
+        let trouble = problems(&parse(&output));
+        assert_eq!(trouble.len(), 1, "one cause, one message: {trouble:?}");
+        assert!(trouble[0].contains("executed no test"), "{trouble:?}");
     }
 
     /// A report that never received a result consumed its parent's: the child
@@ -1040,6 +1061,24 @@ test result: ok. 152 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fi
             .map(String::from)
             .to_vec()
         );
+        // A `-j` after the separator belongs to libtest, not to cargo: it must
+        // pass through rather than be refused as the gate's own flag.
+        let harness_jobs: Vec<String> = ["-p", "xtask", "--", "-j4"].map(String::from).to_vec();
+        assert_eq!(
+            argv(&harness_jobs).expect("a harness -j is not the gate's"),
+            [
+                "test",
+                "-p",
+                "xtask",
+                "--no-fail-fast",
+                "--jobs",
+                "1",
+                "--",
+                "-j4"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
     }
 
     /// `--jobs 1` is the gate's own flag: with binaries running concurrently
@@ -1090,7 +1129,7 @@ test result: ok. 152 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fi
     /// test; this pins that both halves of the copy happen, and that CRLF
     /// lines still parse out of the captured bytes.
     #[test]
-    fn each_chunk_is_echoed_and_kept() {
+    fn a_chunk_is_echoed_and_captured() {
         let fixture = binary(
             1,
             "ok",
@@ -1152,6 +1191,51 @@ error: could not compile `xtask` (bin \"xtask\") due to 2 previous errors
             report.lines().count() < 60,
             "an excerpt, not the transcript: {report}"
         );
+    }
+
+    /// The same guarantee under CI's colour setting: `CARGO_TERM_COLOR=always`
+    /// makes every `error` line start with an escape byte, so a raw prefix
+    /// match found no block and fell back to the tail.
+    #[test]
+    fn a_colored_red_run_keeps_the_first_error_and_its_location() {
+        let mut stderr = String::from(
+            "\u{1b}[1m\u{1b}[91merror[E0308]\u{1b}[0m: mismatched types
+  --> xtask\\src\\main.rs:54:9
+   |
+54 |         Cmd::Workflows => workflows::run(&root),
+   |         ^^^^^^^^^^^^^^ expected unit variant
+   |
+",
+        );
+        for i in 0..80 {
+            stderr.push_str(&format!("   Compiling filler-{i} v0.1.0\n"));
+        }
+        let report = failure_report("", &stderr);
+        assert!(report.contains("E0308"), "{report}");
+        assert!(report.contains("--> xtask\\src\\main.rs:54:9"), "{report}");
+        assert!(report.contains("^^^^^^^^^^^^^^"), "{report}");
+        assert!(
+            report.lines().count() < 60,
+            "an excerpt, not the transcript: {report}"
+        );
+    }
+
+    /// Cargo's own `error:` line keeps its place when it is coloured too.
+    #[test]
+    fn a_colored_cargo_error_line_survives_the_failure_report() {
+        let stdout = "\
+running 1 test
+test a ... FAILED
+
+failures:
+
+---- a stdout ----
+thread 'a' panicked at src\\lib.rs:10:5:
+assertion failed
+";
+        let stderr = "\u{1b}[1m\u{1b}[91merror\u{1b}[0m: test failed, to rerun pass `-p x`\n";
+        let report = failure_report(stdout, stderr);
+        assert!(report.contains("error: test failed"), "{report}");
     }
 
     /// The fallback: a failure with no `error` line at all still reports the
