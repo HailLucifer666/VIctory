@@ -4,4 +4,4 @@
 # produces no run at all, and no CI check can report that from inside CI — this
 # hook is the only place it can be caught.
 # Install with: cargo xtask install-hooks
-cargo xtask policy --staged && cargo xtask workflows
+cargo xtask policy --staged && cargo xtask workflows --staged

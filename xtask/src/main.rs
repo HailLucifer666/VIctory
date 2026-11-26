@@ -38,7 +38,12 @@ enum Cmd {
     /// Fail unless every file under `.github/workflows/` is one GitHub can
     /// load, since a file it cannot load produces no run at all (see
     /// `workflows`).
-    Workflows,
+    Workflows {
+        /// Check only the workflow files staged for commit (used by the
+        /// pre-commit hook).
+        #[arg(long)]
+        staged: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -46,7 +51,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
         Cmd::TestGate { args } => gate::run(&root, &args),
-        Cmd::Workflows => workflows::run(&root),
+        Cmd::Workflows { staged } => workflows::run(&root, staged),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
@@ -57,7 +62,9 @@ fn main() -> Result<()> {
                 status.success(),
                 "git config failed (is this a git repository?)"
             );
-            println!("hooks installed: commits now run `cargo xtask policy --staged`");
+            println!(
+                "hooks installed: commits now run `cargo xtask policy --staged` and `cargo xtask workflows --staged`"
+            );
             Ok(())
         }
     }
