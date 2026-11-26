@@ -1,5 +1,5 @@
-//! `cargo xtask workflows`: every file in `.github/workflows/` must be one
-//! GitHub can load.
+//! `cargo xtask workflows`: every file in `.github/workflows/` must pass the
+//! shape checks this repository can make.
 //!
 //! GitHub reads the workflow files before it creates a job, so a file it
 //! cannot read produces no run at all. Not a failing check — an absent one.
@@ -71,10 +71,17 @@ pub fn problems(file: &str, source: &str) -> Vec<String> {
     // `on` is the trigger list. yaml-rust2 0.13 keeps it the string `on`; a
     // loader that resolved YAML 1.1's `on` to the boolean `true` would fail
     // `a_loadable_workflow_is_accepted` rather than slip through here.
-    if !top.contains_key(&Yaml::String("on".to_owned())) {
-        found.push(format!(
+    match field(top, "on") {
+        None => found.push(format!(
             "{file}: no `on:`; GitHub refuses a workflow with no trigger"
-        ));
+        )),
+        // The key being there is not the question: `on:` with nothing after
+        // it, `on: []` and `on: ''` are all a trigger that names no event, and
+        // GitHub refuses each one rather than run anything.
+        Some(trigger) if !names_an_event(trigger) => found.push(format!(
+            "{file}: `on` names no event; GitHub refuses a workflow no event can trigger"
+        )),
+        Some(_) => {}
     }
 
     let jobs = match field(top, "jobs") {
@@ -130,10 +137,12 @@ pub fn problems(file: &str, source: &str) -> Vec<String> {
             }
         };
         // Without `runs-on` GitHub has nowhere to put the job and refuses the
-        // file. It is the most common hand-written omission.
-        if field(job, "runs-on").is_none() {
+        // file. It is the most common hand-written omission, and the key being
+        // present is not the question: `runs-on:` alone parses as null, and
+        // `runs-on: []` is a list of no runners; neither schedules anything.
+        if !field(job, "runs-on").is_some_and(names_a_runner) {
             found.push(format!(
-                "{file}: job `{name}` has steps but no `runs-on`; GitHub will not schedule it"
+                "{file}: job `{name}` has steps but no `runs-on` naming a runner; GitHub will not schedule it"
             ));
         }
         match steps {
@@ -246,6 +255,11 @@ fn scan_staged(root: &Path) -> Result<Checked> {
             "--cached",
             "--name-only",
             "--diff-filter=ACMR",
+            // Without `-z` git quotes a name it cannot print plainly, and
+            // `café.yml` arrives as `"caf\303\251.yml"` — a leading quote that
+            // no prefix match survives, so the file went unchecked. `-z` also
+            // makes the names NUL-separated, which is the split below.
+            "-z",
             "--",
             ".github/workflows",
         ])
@@ -262,13 +276,28 @@ fn scan_staged(root: &Path) -> Result<Checked> {
         files: Vec::new(),
         problems: Vec::new(),
     };
-    for path in String::from_utf8_lossy(&listed.stdout).lines() {
-        let path = path.trim_end();
-        // The pathspec is a prefix, so it also lists subdirectories; GitHub
-        // reads the top level only.
-        let Some(name) = path.strip_prefix(".github/workflows/") else {
+    for raw in listed.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+        // A name this check cannot even spell is still a name in the commit.
+        // Skipping it would leave a workflow file unchecked with no sign that
+        // it was.
+        let Ok(path) = std::str::from_utf8(raw) else {
+            checked.problems.push(format!(
+                "{}: a staged path under .github/workflows is not valid UTF-8, so this check cannot read it",
+                String::from_utf8_lossy(raw)
+            ));
             continue;
         };
+        // The pathspec is `.github/workflows`, so every name listed is under
+        // it. One that is not is a shape this check does not understand, and
+        // saying nothing would report a pass it did not earn.
+        let Some(name) = path.strip_prefix(".github/workflows/") else {
+            checked.problems.push(format!(
+                "{path}: staged under .github/workflows but not a path this check can read"
+            ));
+            continue;
+        };
+        // GitHub reads the top level only, and only the two workflow
+        // extensions; a subdirectory or another file is not a workflow.
         if name.is_empty() || name.contains('/') || !is_workflow(name) {
             continue;
         }
@@ -308,7 +337,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     }
     if checked.problems.is_empty() {
         println!(
-            "workflows: {} file(s) checked, each one GitHub can load",
+            "workflows: {} file(s) checked, each one passes the shape checks this repository can make",
             checked.files.len()
         );
         return Ok(());
@@ -329,6 +358,37 @@ fn is_workflow(name: &str) -> bool {
 
 fn field<'a>(map: &'a Hash, name: &str) -> Option<&'a Yaml> {
     map.get(&Yaml::String(name.to_owned()))
+}
+
+/// Whether `on:` names at least one event. GitHub takes one event name, a
+/// list of them, or a mapping of event to settings; none of those with nothing
+/// in it triggers anything. `on:` with no value parses as null, not as the
+/// string it was written as.
+fn names_an_event(trigger: &Yaml) -> bool {
+    match trigger {
+        Yaml::String(event) => !event.is_empty(),
+        Yaml::Array(events) => !events.is_empty(),
+        Yaml::Hash(events) => !events.is_empty(),
+        _ => false,
+    }
+}
+
+/// Whether `runs-on:` names a runner. GitHub takes one label, a list of them,
+/// or a group/labels mapping; an empty list or an empty mapping names none.
+fn names_a_runner(runs_on: &Yaml) -> bool {
+    match runs_on {
+        Yaml::String(label) => !label.is_empty(),
+        Yaml::Array(labels) => {
+            !labels.is_empty()
+                && labels
+                    .iter()
+                    .all(|label| matches!(label, Yaml::String(s) if !s.is_empty()))
+        }
+        // `runs-on: { group: …, labels: … }` is a runner group, and refusing it
+        // would be a false red on a workflow GitHub schedules.
+        Yaml::Hash(fields) => !fields.is_empty(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -423,6 +483,63 @@ jobs:
         assert!(found.iter().any(|p| p.contains("no `on:`")), "{found:#?}");
     }
 
+    /// `on:` with nothing after it is the key with a null value. GitHub reads
+    /// that as a trigger naming no event and refuses the file, so it produces
+    /// no run at all. Asking only whether the key exists accepts it.
+    #[test]
+    fn a_null_trigger_is_refused() {
+        let source = "\
+name: CI
+on:
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+";
+        let found = problems("ci.yml", source);
+        assert!(
+            found.iter().any(|p| p.contains("names no event")),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_trigger_list_is_refused() {
+        let source = "\
+name: CI
+on: []
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+";
+        let found = problems("ci.yml", source);
+        assert!(
+            found.iter().any(|p| p.contains("names no event")),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn a_trigger_written_as_an_empty_string_is_refused() {
+        let source = "\
+name: CI
+on: ''
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+";
+        let found = problems("ci.yml", source);
+        assert!(
+            found.iter().any(|p| p.contains("names no event")),
+            "{found:#?}"
+        );
+    }
+
     #[test]
     fn a_step_with_neither_uses_nor_run_is_refused() {
         let source = "\
@@ -470,6 +587,66 @@ jobs:
             found.iter().any(|p| p.contains("no `runs-on`")),
             "{found:#?}"
         );
+    }
+
+    /// `runs-on:` with nothing after it parses as null. The key is there and
+    /// names no runner, so the job has nowhere to run.
+    #[test]
+    fn a_null_runs_on_is_refused() {
+        let source = "\
+name: CI
+on: [pull_request]
+jobs:
+  check:
+    runs-on:
+    steps:
+      - uses: actions/checkout@v5
+";
+        let found = problems("ci.yml", source);
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("no `runs-on` naming a runner")),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_runs_on_list_is_refused() {
+        let source = "\
+name: CI
+on: [pull_request]
+jobs:
+  check:
+    runs-on: []
+    steps:
+      - uses: actions/checkout@v5
+";
+        let found = problems("ci.yml", source);
+        assert!(
+            found
+                .iter()
+                .any(|p| p.contains("no `runs-on` naming a runner")),
+            "{found:#?}"
+        );
+    }
+
+    /// GitHub schedules a job on a runner group given as a mapping, so the
+    /// shape check must not call that missing.
+    #[test]
+    fn a_runs_on_group_mapping_is_accepted() {
+        let source = "\
+name: CI
+on: [pull_request]
+jobs:
+  check:
+    runs-on:
+      group: my-group
+      labels: [self-hosted]
+    steps:
+      - uses: actions/checkout@v5
+";
+        assert_eq!(problems("ci.yml", source), Vec::<String>::new());
     }
 
     /// A job is a call or a job, never both. The `uses` arm would otherwise
@@ -555,38 +732,46 @@ jobs:
         assert!(error.to_string().contains("read nothing"), "{error}");
     }
 
+    /// Run git in `dir`, failing the test with git's stderr if it does not
+    /// succeed.
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("running git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The staged scan needs git. Where it is missing the hook that calls this
+    /// could not run either, so the test says so by not running.
+    fn have_git() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
     /// The staged check reads the blob in the index, not the file beside it:
     /// an edit made after `git add` is not in that commit. This is the whole
     /// reason `--staged` exists.
     #[test]
     fn the_staged_check_reads_the_blob_not_the_worktree() {
-        if std::process::Command::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
+        if !have_git() {
             return; // no git here; the hook that calls this needs it anyway
         }
         let dir = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .current_dir(dir.path())
-                .args(args)
-                .output()
-                .expect("running git");
-            assert!(
-                out.status.success(),
-                "git {args:?}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        };
-        git(&["init", "--quiet"]);
+        git(dir.path(), &["init", "--quiet"]);
         let dir_workflows = dir.path().join(".github").join("workflows");
         std::fs::create_dir_all(&dir_workflows).unwrap();
         let path = dir_workflows.join("ci.yml");
         // A loadable file is staged ...
         std::fs::write(&path, LOADABLE).unwrap();
-        git(&["add", ".github/workflows/ci.yml"]);
+        git(dir.path(), &["add", ".github/workflows/ci.yml"]);
         // ... and then broken in the worktree only.
         std::fs::write(&path, STEP_INDENTED_SHORT).unwrap();
 
@@ -602,6 +787,53 @@ jobs:
         assert!(
             !worktree.problems.is_empty(),
             "the worktree copy is broken, which is the difference"
+        );
+    }
+
+    /// git quotes a name it will not print plainly, so a staged `café.yml`
+    /// arrived as `"caf\303\251.yml"`: a leading quote that no prefix match
+    /// survives. The loop then skipped it without a word, and a broken
+    /// non-ASCII workflow was committed with the hook reporting success.
+    #[test]
+    fn a_staged_non_ascii_workflow_is_checked() {
+        if !have_git() {
+            return; // no git here; the hook that calls this needs it anyway
+        }
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "--quiet"]);
+        let dir_workflows = dir.path().join(".github").join("workflows");
+        std::fs::create_dir_all(&dir_workflows).unwrap();
+        // One file the checks accept, and one broken file under a name git
+        // has to quote.
+        std::fs::write(dir_workflows.join("ci.yml"), LOADABLE).unwrap();
+        std::fs::write(
+            dir_workflows.join("café.yml"),
+            "\
+name: Café
+on: [pull_request]
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses:
+",
+        )
+        .unwrap();
+        git(dir.path(), &["add", ".github/workflows"]);
+
+        let staged = scan(dir.path(), true).expect("reading staged workflows");
+        assert!(
+            staged.files.iter().any(|file| file == "café.yml"),
+            "the non-ASCII workflow was not read: {:?}",
+            staged.files
+        );
+        assert!(
+            staged
+                .problems
+                .iter()
+                .any(|p| p.contains("café.yml") && p.contains("`uses` is not a string")),
+            "the broken non-ASCII workflow was not reported: {:#?}",
+            staged.problems
         );
     }
 }

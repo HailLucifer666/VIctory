@@ -12,8 +12,11 @@
 //!
 //! - Targets run serially (`--jobs 1`). Cargo otherwise runs test binaries
 //!   concurrently into one stdout, so a `test result:` from one binary lands
-//!   between another's lines and no report can be attributed. Measured at no
-//!   cost: 27s either way over this workspace.
+//!   between another's lines and no report can be attributed. A caller's own
+//!   `-j`/`--jobs` is refused rather than honoured, because it would void the
+//!   property the reading depends on. `--jobs 1` serializes compilation too,
+//!   so CI builds the suite in parallel first (`cargo test --no-run`) and
+//!   runs this with nothing left to build.
 //! - The counts are only read when `cargo test` exited 0. A failing run
 //!   dumps captured test output into the same stream, which can contain
 //!   harness-shaped lines; that run is already red, so the gate reports
@@ -23,23 +26,32 @@
 //! - Reports nest. A test that spawns `current_exe()` writes the child's
 //!   harness lines into the same stream, ahead of the parent's own result.
 //!   `parse` attaches counts last-in-first-out, and only the outermost
-//!   reports — the binaries cargo ran and named — are gated.
+//!   reports — the binaries cargo ran and named — are gated. A report that
+//!   never closes is named as such: its parent's result went to the child, so
+//!   its zeros are not what it executed.
+//!
+//! Cargo names each target it runs, and those names must pair one-to-one with
+//! the outermost reports. When they do not, nothing attributes a report to a
+//! binary, so the per-binary check cannot run and the run is refused rather
+//! than reported green with the check silently skipped.
 //!
 //! Doc-test binaries are exempt from the per-binary zero check: a crate with
 //! no doc examples runs no doc tests, and a workspace sweep would otherwise
 //! be permanently red for a fact that is not a defect. The whole-run check
 //! still covers them.
 
+use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 /// One test binary: what it announced, and what it reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     /// The target as cargo named it, e.g. `unittests src\main.rs`; `None`
-    /// when cargo's targets could not be lined up with the reports.
+    /// until `pair` attaches one, which happens only when cargo's names and
+    /// the reports line up.
     pub target: Option<String>,
     /// How many reports were open when this one was announced: 0 is a binary
     /// cargo ran, 1+ is a child process a test spawned. A test that spawns
@@ -48,6 +60,11 @@ pub struct Report {
     pub depth: usize,
     /// What `running N tests` announced; ignored tests are counted here.
     pub announced: usize,
+    /// Whether no `test result:` ever closed this announcement. A child that
+    /// announces inside its parent and never reports consumes the parent's
+    /// result, so the parent is left like this; its zeros are not what it
+    /// executed and it is named instead of read as a binary that ran nothing.
+    pub unreported: bool,
     pub passed: usize,
     pub failed: usize,
     pub ignored: usize,
@@ -76,12 +93,24 @@ impl Report {
 /// Appending them at the end instead hands `--no-fail-fast` and `--jobs` to
 /// libtest as soon as the caller has written `--`, and libtest refuses them
 /// (`error: Unrecognized option: 'no-fail-fast'`, exit 101, no test runs).
-pub fn argv(args: &[String]) -> Vec<String> {
+///
+/// `--jobs 1` is not optional: with binaries running concurrently into one
+/// stdout, no report can be attributed, so a caller's `-j`/`--jobs` is refused
+/// rather than honoured or silently overridden.
+pub fn argv(args: &[String]) -> Result<Vec<String>> {
     let separator = args.iter().position(|a| a == "--");
     let (to_cargo, to_harness) = match separator {
         Some(at) => (&args[..at], Some(&args[at + 1..])),
         None => (args, None),
     };
+    if let Some(given) = to_cargo
+        .iter()
+        .find(|a| a.starts_with("-j") || a.starts_with("--jobs"))
+    {
+        bail!(
+            "`{given}` is the gate's own flag: it runs one test binary at a time, which is what makes every report attributable; remove it from the arguments"
+        );
+    }
     let mut out = vec![String::from("test")];
     out.extend(to_cargo.iter().cloned());
     // Every binary reports, even when an earlier one failed.
@@ -90,34 +119,47 @@ pub fn argv(args: &[String]) -> Vec<String> {
     }
     // See the module doc: without one binary at a time, the output cannot be
     // attributed.
-    if !to_cargo
-        .iter()
-        .any(|a| a.starts_with("-j") || a.starts_with("--jobs"))
-    {
-        out.push(String::from("--jobs"));
-        out.push(String::from("1"));
-    }
+    out.push(String::from("--jobs"));
+    out.push(String::from("1"));
     if let Some(to_harness) = to_harness {
         out.push(String::from("--"));
         out.extend(to_harness.iter().cloned());
     }
-    out
+    Ok(out)
 }
 
 /// Run `cargo test` with `args`, then gate the run.
 pub fn run(root: &Path, args: &[String]) -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
-    command.args(argv(args));
-    let out = command
+    command.args(argv(args)?);
+    // Streamed, not buffered. `.output()` kept everything until the child
+    // exited, so a run that hung -- or was killed by CI's timeout -- left no
+    // log at all. Each chunk is echoed as it arrives and collected for the
+    // checks below.
+    let mut child = command
         .current_dir(root)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("running `cargo test`")?;
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .context("cargo test left no stdout pipe")?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .context("cargo test left no stderr pipe")?;
+    let stdout_thread = std::thread::spawn(move || copy(stdout_pipe, std::io::stdout()));
+    let stderr_thread = std::thread::spawn(move || copy(stderr_pipe, std::io::stderr()));
+    let status = child.wait().context("waiting for `cargo test`")?;
+    let stdout = joined(stdout_thread, "stdout")?;
+    let stderr = joined(stderr_thread, "stderr")?;
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
 
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
-    if !out.status.success() {
+    if !status.success() {
         // Already red, so the counts are not read: a failure dump can hold
         // harness-shaped lines. The report is what a reader needs instead,
         // and this process captured it, so nothing else will print it.
@@ -125,67 +167,40 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
         if !report.is_empty() {
             eprintln!("{report}");
         }
-        bail!("cargo test exited {}", out.status);
+        bail!("cargo test exited {status}");
     }
 
     let mut reports = parse(&stdout);
     if reports.is_empty() {
         // Nothing to gate: say why rather than report success on nothing.
         bail!(
-            "no test binary reported anything (cargo test exited {}):\n{}",
-            out.status,
+            "no test binary reported anything (cargo test exited {status}):\n{}",
             tail(&stderr, 20)
         );
     }
-    // Only the outermost reports are binaries cargo ran. The rest are child
-    // processes a test spawned to run this binary again, and cargo has no
-    // target name for them.
-    let top: Vec<usize> = reports
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.depth == 0)
-        .map(|(i, _)| i)
-        .collect();
     let names = targets(&stderr);
-    // Cargo names each target on stderr just before running it, so the Nth
-    // name matches the Nth target report -- while the counts agree. A wrong
-    // name is worse than none, and the per-binary rules need a real one.
-    let paired = names.len() == top.len();
-    if paired {
-        for (index, name) in top.iter().zip(&names) {
-            reports[*index].target = Some(name.clone());
-        }
-    }
-
-    for r in reports.iter().filter(|r| r.depth == 0) {
-        println!(
-            "  {}: {} announced, {} accounted for ({} passed, {} failed, {} ignored)",
-            r.label(),
-            r.announced,
-            r.counted(),
-            r.passed,
-            r.failed,
-            r.ignored
+    if let Err(problem) = pair(&mut reports, &names) {
+        // Nothing attributes a report to a binary, so the per-binary rules
+        // cannot run. The counts are printed once so the reader can see what
+        // came out of the stream, then the run is refused.
+        print_reports(&reports);
+        eprintln!("GATE: {problem}");
+        bail!(
+            "this run's reports cannot be attributed to the binaries cargo ran, so it cannot be called green"
         );
     }
-    let top_reports: Vec<Report> = top.iter().map(|i| reports[*i].clone()).collect();
+    print_reports(&reports);
+    let top_reports: Vec<Report> = reports.iter().filter(|r| r.depth == 0).cloned().collect();
     let ran: usize = top_reports.iter().map(Report::ran).sum();
     println!(
         "test gate: {} binary/binaries, {ran} test(s) executed",
         top_reports.len()
     );
-    let nested = reports.len() - top.len();
+    let nested = reports.len() - top_reports.len();
     if nested > 0 {
         // Counted separately, not hidden: a nested run is a test running
         // this binary again, not a target cargo executed.
         println!("test gate: {nested} nested report(s), from test(s) that ran this binary again");
-    }
-    if !paired {
-        println!(
-            "test gate: {} target name(s) from cargo for {} report(s); per-binary check skipped",
-            names.len(),
-            top_reports.len()
-        );
     }
 
     let problems = problems(&top_reports);
@@ -201,22 +216,99 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Read a child's stream to EOF, echoing each chunk as it arrives and
+/// returning everything read.
+///
+/// The echo happens per chunk rather than after the child exits, so a run that
+/// hangs -- or is killed by CI's timeout -- keeps the log of what it had
+/// printed.
+fn copy(mut from: impl Read, mut to: impl Write) -> std::io::Result<Vec<u8>> {
+    let mut all = Vec::new();
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        let read = from.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(all);
+        }
+        all.extend_from_slice(&buffer[..read]);
+        // The capture is what the gate parses. A destination that closed (a
+        // reader that piped this into `head` and stopped) must not lose it,
+        // so its error is dropped rather than failing the run.
+        let _ = to.write_all(&buffer[..read]);
+        let _ = to.flush();
+    }
+}
+
+/// Wait for one of the reader threads and collect what it captured.
+fn joined(
+    thread: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream: &str,
+) -> Result<Vec<u8>> {
+    thread
+        .join()
+        .map_err(|_| anyhow!("the thread reading cargo's {stream} panicked"))?
+        .with_context(|| format!("reading cargo's {stream}"))
+}
+
+/// Attach cargo's target names to the reports of the binaries cargo ran.
+///
+/// Cargo names each target on stderr just before running it, so the Nth name
+/// matches the Nth outermost report -- while the counts agree. When they do
+/// not, nothing attributes a report to a binary: a caller's `-j` interleaves
+/// them, and a report that arrives after another's summary has no place in
+/// the order. A wrong name is worse than none, and the per-binary rules need
+/// a real one, so a mismatch is an error rather than a skipped check.
+pub fn pair(reports: &mut [Report], names: &[String]) -> Result<()> {
+    let top: Vec<usize> = reports
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.depth == 0)
+        .map(|(i, _)| i)
+        .collect();
+    if names.len() != top.len() {
+        bail!(
+            "cargo named {} target(s) but {} report(s) came from binaries it ran; no report can be attributed to a binary",
+            names.len(),
+            top.len()
+        );
+    }
+    for (index, name) in top.iter().zip(names) {
+        reports[*index].target = Some(name.clone());
+    }
+    Ok(())
+}
+
+/// One line per binary cargo ran, in the order it ran them.
+fn print_reports(reports: &[Report]) {
+    for r in reports.iter().filter(|r| r.depth == 0) {
+        println!(
+            "  {}: {} announced, {} accounted for ({} passed, {} failed, {} ignored)",
+            r.label(),
+            r.announced,
+            r.counted(),
+            r.passed,
+            r.failed,
+            r.ignored
+        );
+    }
+}
+
 /// Everything wrong with a run that exited 0. Pure, so the rules can be
 /// tested without a suite to run.
 pub fn problems(reports: &[Report]) -> Vec<String> {
-    // One cause, one message: when nothing ran at all (an empty list
-    // included), the per-binary report would only repeat this for every
-    // binary in the run.
-    let ran: usize = reports.iter().map(Report::ran).sum();
-    if ran == 0 {
-        return vec![format!(
-            "the run executed no test ({} binary/binaries, {} announced)",
-            reports.len(),
-            reports.iter().map(|r| r.announced).sum::<usize>()
-        )];
-    }
     let mut out = Vec::new();
-    for r in reports {
+    // An announcement no result ever closed: a child that announced inside
+    // its parent and never reported consumed the parent's result, so the
+    // parent's zeros are not what it executed. Named as the unaccounted
+    // announcement it is; "accounted for 0" would report the symptom.
+    for r in reports.iter().filter(|r| r.unreported) {
+        out.push(format!(
+            "{}: announced {} and never accounted for",
+            r.label(),
+            r.announced
+        ));
+    }
+    for r in reports.iter().filter(|r| !r.unreported) {
         if r.counted() != r.announced {
             out.push(format!(
                 "{}: announced {} test(s), accounted for {}",
@@ -239,6 +331,25 @@ pub fn problems(reports: &[Report]) -> Vec<String> {
                 r.label()
             ));
         }
+    }
+    let ran: usize = reports.iter().map(Report::ran).sum();
+    if ran == 0 && out.is_empty() {
+        // One cause, one message. Nothing ran, and every announcement was
+        // closed by its own result, so the per-binary rules above found
+        // nothing to say. Two ways to get here, and they are not the same
+        // run: nothing was announced at all (an empty list included), or
+        // tests were announced and every one was ignored.
+        let announced: usize = reports.iter().map(|r| r.announced).sum();
+        if announced == 0 {
+            return vec![format!(
+                "the run executed no test ({} binary/binaries, {} announced)",
+                reports.len(),
+                announced
+            )];
+        }
+        return vec![format!(
+            "{announced} test(s) announced and none executed (every test that reported was ignored)"
+        )];
     }
     out
 }
@@ -263,6 +374,7 @@ pub fn parse(output: &str) -> Vec<Report> {
                 target: None,
                 depth: open.len(),
                 announced,
+                unreported: true,
                 passed: 0,
                 failed: 0,
                 ignored: 0,
@@ -272,6 +384,7 @@ pub fn parse(output: &str) -> Vec<Report> {
             && let Some(index) = open.pop()
         {
             let report = &mut reports[index];
+            report.unreported = false;
             report.passed = passed;
             report.failed = failed;
             report.ignored = ignored;
@@ -349,14 +462,14 @@ fn tail(text: &str, count: usize) -> String {
 ///
 /// A failing test is named, and the panic block libtest printed for it is
 /// echoed. A run that failed with no failed test never reached one: a build
-/// error, a bad argument, or a harness that refused a flag. Its useful lines
-/// — `error[E0308]`, the `--> file:line` that locates it, the span under it —
-/// do not all begin with `error`, so a prefix filter drops exactly the
-/// location and leaves the reader with a message and nothing to open.
+/// error, a bad argument, or a harness that refused a flag. For that the first
+/// error block(s) are quoted whole — the `error[E0308]` line, the `--> file:line`
+/// that locates it, the span under it — because a prefix filter drops the
+/// location and a tail drops the cause.
 pub fn failure_report(stdout: &str, stderr: &str) -> String {
     let failed = failures(stdout);
     if failed.is_empty() {
-        return tail(stderr, 60);
+        return error_excerpt(stderr);
     }
     let mut out = String::new();
     for line in stderr
@@ -382,6 +495,51 @@ pub fn failure_report(stdout: &str, stderr: &str) -> String {
         out.push('\n');
     }
     out.trim_end().to_owned()
+}
+
+/// How much of a red stream to quote: the first few error blocks, each with
+/// its context, not the whole transcript.
+const EXCERPT_BLOCKS: usize = 4;
+const EXCERPT_BLOCK_LINES: usize = 24;
+
+/// The first error blocks of a red stream, with the lines that locate them.
+///
+/// rustc writes one block per error: the `error[E…]` line, the `--> file:line`
+/// that locates it, the source line the span marks, then a blank line. A run
+/// that failed before any test can print hundreds of lines after the first
+/// error — a whole build transcript — so a tail of the stream drops exactly
+/// the error that explains the rest. The stream's tail is still the fallback
+/// for a failure that prints no `error` line at all.
+pub fn error_excerpt(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim_end).collect();
+    let mut out: Vec<&str> = Vec::new();
+    let mut blocks = 0;
+    let mut start = 0;
+    while start < lines.len() && blocks < EXCERPT_BLOCKS {
+        if !lines[start].starts_with("error") {
+            start += 1;
+            continue;
+        }
+        blocks += 1;
+        // The error line, then its context until a blank line or the next
+        // error. The cap is a safety net for a block that never ends; rustc
+        // puts the `-->` and the span well inside it.
+        let mut end = start + 1;
+        while end < lines.len()
+            && end < start + EXCERPT_BLOCK_LINES
+            && !lines[end].trim().is_empty()
+            && !lines[end].starts_with("error")
+        {
+            end += 1;
+        }
+        out.extend_from_slice(&lines[start..end]);
+        out.push("");
+        start = end;
+    }
+    if out.is_empty() {
+        return tail(stderr, 60);
+    }
+    out.join("\n").trim_end().to_owned()
 }
 
 /// What each failing test printed, from libtest's `---- <name> stdout ----`
@@ -434,7 +592,9 @@ fn details(output: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Report, argv, details, failure_report, failures, parse, problems, targets};
+    use super::{
+        Report, argv, copy, details, failure_report, failures, pair, parse, problems, run, targets,
+    };
 
     /// One binary: `announced` tests, one `ok` line per test, then the result.
     fn binary(announced: usize, verdict: &str, counts: &str) -> String {
@@ -462,9 +622,149 @@ mod tests {
     #[test]
     fn a_filter_that_matched_nothing_is_one_failure() {
         let nothing = "0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out";
-        let trouble = problems(&parse(&binary(0, "ok", nothing)));
+        // A second binary that ran something, so the whole-run rule does not
+        // answer first: this exercises the per-binary `filtered` rule.
+        let mut reports = parse(&format!(
+            "{}{}",
+            binary(2, "ok", OK2),
+            binary(0, "ok", nothing)
+        ));
+        reports[1].target = Some(String::from("unittests src\\lib.rs"));
+        let trouble = problems(&reports);
         assert_eq!(trouble.len(), 1, "one cause, one message: {trouble:?}");
-        assert!(trouble[0].contains("executed no test"), "{trouble:?}");
+        assert!(
+            trouble[0].contains("a filter that matched nothing"),
+            "{trouble:?}"
+        );
+    }
+
+    /// A report that never received a result consumed its parent's: the child
+    /// announced inside the parent, took the parent's result, and left the
+    /// parent reading as "announced 4, accounted for 0". The old whole-run
+    /// message called that "executed no test (1 binary, 4 announced)", which
+    /// contradicts itself -- four tests did run. The unclosed announcement is
+    /// what happened, and it is named.
+    #[test]
+    fn a_child_that_announces_and_never_reports_is_named() {
+        let output = "\
+running 4 tests
+running 1 test
+test t0 ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+";
+        let reports = parse(output);
+        assert_eq!(reports.len(), 2);
+        assert!(reports[0].unreported, "the parent's result went away");
+        assert!(!reports[1].unreported, "the child took it");
+        assert_eq!(
+            reports[1].counted(),
+            4,
+            "the child holds the parent's counts"
+        );
+        let mut top: Vec<Report> = reports.into_iter().filter(|r| r.depth == 0).collect();
+        top[0].target = Some(String::from("unittests src\\lib.rs"));
+        let trouble = problems(&top);
+        assert!(
+            trouble
+                .iter()
+                .any(|p| p.contains("unittests src\\lib.rs: announced 4 and never accounted for")),
+            "{trouble:?}"
+        );
+        assert!(
+            !trouble.iter().any(|p| p.contains("executed no test")),
+            "four tests were announced, so this is not an empty run: {trouble:?}"
+        );
+    }
+
+    /// A run where every announced test was ignored executed nothing, which
+    /// the gate refuses. It is not the empty-run case: the message says what
+    /// happened instead of claiming nothing was announced.
+    #[test]
+    fn a_run_where_every_test_was_ignored_executed_nothing() {
+        let output = "\
+running 4 tests
+test t0 ... ignored
+test t1 ... ignored
+test t2 ... ignored
+test t3 ... ignored
+
+test result: ok. 0 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.01s
+";
+        let trouble = problems(&parse(output));
+        assert_eq!(trouble.len(), 1, "{trouble:?}");
+        assert!(trouble[0].contains("none executed"), "{trouble:?}");
+        assert!(trouble[0].contains("ignored"), "{trouble:?}");
+    }
+
+    /// Cargo names each target it runs. When the names and the reports do not
+    /// line up, nothing attributes a report to a binary -- a caller's `-j`
+    /// interleaves them, and a report that arrives after another's summary has
+    /// no place in the order -- so the per-binary check cannot run and the run
+    /// cannot be called green.
+    #[test]
+    fn a_run_whose_reports_do_not_pair_with_cargos_names_is_refused() {
+        let output = format!("{}{}", binary(2, "ok", OK2), binary(4, "ok", OK4));
+        let mut reports = parse(&output);
+        assert_eq!(reports.len(), 2);
+
+        let one_name = targets("Running unittests src\\main.rs (target\\debug\\deps\\xtask.exe)\n");
+        let error = pair(&mut reports, &one_name).expect_err("one name and two reports");
+        assert!(
+            error.to_string().contains("no report can be attributed"),
+            "{error}"
+        );
+        assert!(
+            reports.iter().all(|r| r.target.is_none()),
+            "no name is attached to the wrong binary: {reports:?}"
+        );
+
+        // The same reports with a name each do pair, in cargo's order.
+        let two_names = targets(
+            "Running unittests src\\main.rs (target\\debug\\deps\\xtask.exe)\nDoc-tests xtask\n",
+        );
+        pair(&mut reports, &two_names).expect("two names and two reports");
+        assert_eq!(reports[0].target.as_deref(), Some("unittests src\\main.rs"));
+        assert_eq!(reports[1].target.as_deref(), Some("Doc-tests xtask"));
+    }
+
+    /// The end-to-end form of the pairing rule: `run` must refuse a stream
+    /// whose reports cannot be attributed. `--quiet` keeps the nested
+    /// project's own target names off the stream -- the gate reading this
+    /// suite would take them for extra binaries -- and leaves two reports with
+    /// no names at all. Before the fix this run printed a note on stdout and
+    /// exited 0.
+    #[test]
+    fn a_run_cargo_cannot_attribute_is_refused_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\n\
+             name = \"mismatch\"\n\
+             version = \"0.0.0\"\n\
+             edition = \"2021\"\n\
+             \n\
+             [workspace]\n\
+             \n\
+             [[test]]\n\
+             name = \"quiet\"\n\
+             path = \"tests/quiet.rs\"\n\
+             harness = false\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src").join("lib.rs"),
+            "#[test]\nfn it_works() {}\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests").join("quiet.rs"), "fn main() {}\n").unwrap();
+
+        let error = run(dir.path(), &[String::from("--quiet")]).expect_err("two reports, no names");
+        assert!(
+            error.to_string().contains("cannot be attributed"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -502,9 +802,10 @@ mod tests {
 
     #[test]
     fn an_unnamed_zero_report_is_not_called_a_filtered_one() {
-        // Names and reports do not always line up. Without a name the gate
-        // cannot tell a doc-test target from a filtered one, and guessing
-        // would fail every doc-test crate in the workspace.
+        // Without a name the gate cannot tell a doc-test target from a
+        // filtered one, and guessing would fail every doc-test crate in the
+        // workspace. `run` refuses a run whose names do not pair before the
+        // per-binary rules see it; the rule itself still must not guess.
         let quiet = "0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
         let reports = parse(&format!(
             "{}{}",
@@ -625,7 +926,7 @@ test result: ok. 152 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fi
             .map(String::from)
             .to_vec();
         assert_eq!(
-            argv(&given),
+            argv(&given).expect("no job count given"),
             [
                 "test",
                 "-p",
@@ -641,17 +942,69 @@ test result: ok. 152 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fi
         );
     }
 
+    /// `--jobs 1` is the gate's own flag: with binaries running concurrently
+    /// into one stream no report can be attributed, so a caller's `-j`/`--jobs`
+    /// would void the reading. Refused rather than honoured (which breaks the
+    /// gate) or silently overridden (which ignores what was asked).
+    #[test]
+    fn a_caller_jobs_flag_is_refused() {
+        for given in [
+            vec!["-p", "xtask", "--jobs", "4"],
+            vec!["-p", "xtask", "--jobs=4"],
+            vec!["-p", "xtask", "-j", "4"],
+            vec!["-p", "xtask", "-j4"],
+        ] {
+            let given: Vec<String> = given.into_iter().map(String::from).collect();
+            let error = argv(&given).expect_err("a caller job count is refused");
+            assert!(
+                error.to_string().contains("one test binary at a time"),
+                "{given:?}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn flags_the_caller_gave_are_not_duplicated() {
-        let given: Vec<String> = ["-p", "xtask", "--jobs", "4", "--no-fail-fast"]
-            .map(String::from)
-            .to_vec();
+        let given: Vec<String> = ["-p", "xtask", "--no-fail-fast"].map(String::from).to_vec();
+        let out = argv(&given).expect("no job count to refuse");
         assert_eq!(
-            argv(&given),
-            ["test", "-p", "xtask", "--jobs", "4", "--no-fail-fast"]
-                .map(String::from)
-                .to_vec()
+            out.iter()
+                .filter(|a| a.as_str() == "--no-fail-fast")
+                .count(),
+            1,
+            "given once by the caller, not added again: {out:?}"
         );
+        assert_eq!(
+            out.iter().filter(|a| a.as_str() == "--jobs").count(),
+            1,
+            "the gate sets its own flag once: {out:?}"
+        );
+        assert!(
+            out.windows(2).any(|w| w[0] == "--jobs" && w[1] == "1"),
+            "--jobs 1 is forced: {out:?}"
+        );
+    }
+
+    /// The child's chunks are echoed as they arrive and kept for the checks.
+    /// The hang this streaming exists to survive is not reproducible in a unit
+    /// test; this pins that both halves of the copy happen, and that CRLF
+    /// lines still parse out of the captured bytes.
+    #[test]
+    fn each_chunk_is_echoed_and_kept() {
+        let fixture = binary(
+            1,
+            "ok",
+            "1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out",
+        )
+        .replace('\n', "\r\n");
+        let mut echoed = Vec::new();
+        let kept = copy(std::io::Cursor::new(fixture.as_bytes()), &mut echoed)
+            .expect("copying the child's stream");
+        assert_eq!(kept, echoed, "every byte read was also echoed");
+        let text = String::from_utf8_lossy(&kept);
+        let parsed = parse(&text);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].counted(), 1, "CRLF lines still parse: {text:?}");
     }
 
     /// A build error is not a test failure, and the line that locates it does
@@ -671,6 +1024,44 @@ error: could not compile `xtask` (bin \"xtask\") due to 2 previous errors
         let report = failure_report("", stderr);
         assert!(report.contains("--> xtask\\src\\main.rs:54:9"), "{report}");
         assert!(report.contains("E0308"), "{report}");
+    }
+
+    /// A long transcript must not bury the error that caused it. The report
+    /// used to print the last 60 stderr lines, so an error at the top of a
+    /// build log was dropped along with its `-->` location and caret span.
+    #[test]
+    fn a_long_red_run_keeps_the_first_error_and_its_location() {
+        let mut stderr = String::from(
+            "error[E0308]: mismatched types
+  --> xtask\\src\\main.rs:54:9
+   |
+54 |         Cmd::Workflows => workflows::run(&root),
+   |         ^^^^^^^^^^^^^^ expected unit variant
+   |
+",
+        );
+        // More than the old 60-line tail, so the tail alone cannot hold it.
+        for i in 0..80 {
+            stderr.push_str(&format!("   Compiling filler-{i} v0.1.0\n"));
+        }
+        let report = failure_report("", &stderr);
+        assert!(report.contains("E0308"), "{report}");
+        assert!(report.contains("--> xtask\\src\\main.rs:54:9"), "{report}");
+        assert!(report.contains("^^^^^^^^^^^^^^"), "{report}");
+        assert!(
+            report.lines().count() < 60,
+            "an excerpt, not the transcript: {report}"
+        );
+    }
+
+    /// The fallback: a failure with no `error` line at all still reports the
+    /// end of the stream, where a tool that prints no diagnostics puts its
+    /// reason.
+    #[test]
+    fn a_red_run_without_an_error_line_keeps_the_tail() {
+        let stderr = "   Compiling victory-core v0.1.0\nnote: the real reason is here\n";
+        let report = failure_report("", stderr);
+        assert!(report.contains("the real reason is here"), "{report}");
     }
 
     #[test]
